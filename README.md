@@ -87,16 +87,11 @@ Alternatively, to manually configure VS Code, choose the appropriate JSON block 
 
 ### Configuration
 
-#### Default toolset configuration
-
-The default configuration is:
-- context
-- repos
-- issues
-- pull_requests
-- users
+#### Toolset configuration
 
 See [Remote Server Documentation](docs/remote-server.md) for full details on remote server configuration, toolsets, headers, and advanced usage. This file provides comprehensive instructions and examples for connecting, customizing, and installing the remote GitHub MCP Server in VS Code and other MCP hosts.
+
+When no toolsets are specified, [default toolsets](#default-toolset) are used.
 
 #### Enterprise Cloud with data residency (ghe.com)
 
@@ -118,6 +113,43 @@ Example for `https://octocorp.ghe.com`:
 ```
 
 GitHub Enterprise Server does not support remote server hosting. Please refer to [GitHub Enterprise Server and Enterprise Cloud with data residency (ghe.com)](#github-enterprise-server-and-enterprise-cloud-with-data-residency-ghecom) from the local server configuration.
+
+---
+
+## HTTP Server Mode
+
+The GitHub MCP Server can run in HTTP mode, allowing it to serve multiple clients concurrently. This is useful for enterprise scenarios where you want to run a single MCP server instance that handles multiple external clients.
+
+### Starting the HTTP Server
+
+To run the server in HTTP mode, use the `http` command:
+
+```bash
+github-mcp-server http --port 8080
+```
+
+Or with Docker:
+
+```bash
+docker run -p 8080:8080 \
+  -e GITHUB_PERSONAL_ACCESS_TOKEN=<your-token> \
+  ghcr.io/github/github-mcp-server http --port 8080
+```
+
+### HTTP Server with "Bring Your Own Token"
+
+When running the server in HTTP mode, clients can provide their own GitHub token with each request using the `Authorization` header:
+
+```http
+Authorization: Bearer <github-token>
+```
+
+This allows each client to authenticate with their own credentials, enabling:
+- Multi-tenant deployments where each user has their own access level
+- Enterprise use cases with centralized MCP server infrastructure
+- OAuth-based authentication flows
+
+If no `Authorization` header is provided, the server will fall back to using the token specified via the `GITHUB_PERSONAL_ACCESS_TOKEN` environment variable (if configured).
 
 ---
 
@@ -329,7 +361,7 @@ The GitHub MCP Server supports enabling or disabling specific groups of function
 
 _Toolsets are not limited to Tools. Relevant MCP Resources and Prompts are also included where applicable._
 
-The Local GitHub MCP Server follows the same [default toolset configuration](#default-toolset-configuration) as the remote version.
+When no toolsets are specified, [default toolsets](#default-toolset) are used.
 
 #### Specifying Toolsets
 
@@ -359,7 +391,9 @@ docker run -i --rm \
   ghcr.io/github/github-mcp-server
 ```
 
-### The "all" Toolset
+### Special toolsets
+
+#### "all" toolset
 
 The special toolset `all` can be provided to enable all available toolsets regardless of any other configuration:
 
@@ -373,9 +407,25 @@ Or using the environment variable:
 GITHUB_TOOLSETS="all" ./github-mcp-server
 ```
 
+#### "default" toolset
+The default toolset `default` is the configuration that gets passed to the server if no toolsets are specified.
+
+The default configuration is:
+- context
+- repos
+- issues
+- pull_requests
+- users
+
+To keep the default configuration and add additional toolsets:
+
+```bash
+GITHUB_TOOLSETS="default,stargazers" ./github-mcp-server
+```
+
 ### Available Toolsets
 
-The following sets of tools are available (all are on by default):
+The following sets of tools are available:
 
 <!-- START AUTOMATED TOOLSETS -->
 | Toolset                 | Description                                                   |
@@ -399,6 +449,14 @@ The following sets of tools are available (all are on by default):
 | `stargazers` | GitHub Stargazers related tools |
 | `users` | GitHub User related tools |
 <!-- END AUTOMATED TOOLSETS -->
+
+### Additional Toolsets in Remote Github MCP Server
+
+| Toolset                 | Description                                                   |
+| ----------------------- | ------------------------------------------------------------- |
+| `copilot` | Copilot related tools (e.g. Copilot Coding Agent) |
+| `copilot_spaces` | Copilot Spaces related tools |
+| `github_support_docs_search` | Search docs to answer GitHub product and support questions |
 
 ## Tools
 
@@ -1167,7 +1225,7 @@ Possible options:
 
 <details>
 
-<summary>Copilot coding agent</summary>
+<summary>Copilot</summary>
 
 -   **create_pull_request_with_copilot** - Perform task with GitHub Copilot coding agent
     -   `owner`: Repository owner. You can guess the owner, but confirm it with the user before proceeding. (string, required)
@@ -1187,6 +1245,14 @@ Possible options:
     -   `name`: The name of the space. (string, required)
 
 -   **list_copilot_spaces** - List Copilot Spaces
+</details>
+
+<details>
+
+<summary>GitHub Support Docs Search</summary>
+
+-   **github_support_docs_search** - Retrieve documentation relevant to answer GitHub product and support questions. Support topics include: GitHub Actions Workflows, Authentication, GitHub Support Inquiries, Pull Request Practices, Repository Maintenance, GitHub Pages, GitHub Packages, GitHub Discussions, Copilot Spaces
+    -   `query`: Input from the user about the question they need answered. This is the latest raw unedited user message. You should ALWAYS leave the user message as it is, you should never modify it. (string, required)
 </details>
 
 ## Dynamic Tool Discovery

@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/github/github-mcp-server/pkg/errors"
 	"github.com/github/github-mcp-server/pkg/github"
@@ -22,6 +23,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/shurcooL/githubv4"
+	"github.com/sirupsen/logrus"
 )
 
 type MCPServerConfig struct {
@@ -105,15 +107,10 @@ func NewMCPServer(cfg MCPServerConfig) (*server.MCPServer, error) {
 		},
 	}
 
-	enabledToolsets := cfg.EnabledToolsets
-	if cfg.DynamicToolsets {
-		// filter "all" from the enabled toolsets
-		enabledToolsets = make([]string, 0, len(cfg.EnabledToolsets))
-		for _, toolset := range cfg.EnabledToolsets {
-			if toolset != "all" {
-				enabledToolsets = append(enabledToolsets, toolset)
-			}
-		}
+	enabledToolsets, invalidToolsets := cleanToolsets(cfg.EnabledToolsets, cfg.DynamicToolsets)
+
+	if len(invalidToolsets) > 0 {
+		fmt.Fprintf(os.Stderr, "Invalid toolsets ignored: %s\n", strings.Join(invalidToolsets, ", "))
 	}
 
 	// Generate instructions based on enabled toolsets
@@ -124,11 +121,39 @@ func NewMCPServer(cfg MCPServerConfig) (*server.MCPServer, error) {
 		server.WithHooks(hooks),
 	)
 
-	getClient := func(_ context.Context) (*gogithub.Client, error) {
+	getClient := func(ctx context.Context) (*gogithub.Client, error) {
+		if tokenVal := ctx.Value(githubTokenKey{}); tokenVal != nil {
+			if token, ok := tokenVal.(string); ok && token != "" {
+				client := gogithub.NewClient(nil).WithAuthToken(token)
+				client.UserAgent = restClient.UserAgent
+				client.BaseURL = apiHost.baseRESTURL
+				client.UploadURL = apiHost.uploadURL
+				return client, nil
+			}
+		}
 		return restClient, nil // closing over client
 	}
 
-	getGQLClient := func(_ context.Context) (*githubv4.Client, error) {
+	getGQLClient := func(ctx context.Context) (*githubv4.Client, error) {
+		if tokenVal := ctx.Value(githubTokenKey{}); tokenVal != nil {
+			if token, ok := tokenVal.(string); ok && token != "" {
+				httpClient := &http.Client{
+					Transport: &bearerAuthTransport{
+						transport: http.DefaultTransport,
+						token:     token,
+					},
+				}
+				if gqlHTTPClient.Transport != nil {
+					if uaTransport, ok := gqlHTTPClient.Transport.(*userAgentTransport); ok {
+						httpClient.Transport = &userAgentTransport{
+							transport: httpClient.Transport,
+							agent:     uaTransport.agent,
+						}
+					}
+				}
+				return githubv4.NewEnterpriseClient(apiHost.graphqlURL.String(), httpClient), nil
+			}
+		}
 		return gqlClient, nil // closing over client
 	}
 
@@ -157,6 +182,46 @@ func NewMCPServer(cfg MCPServerConfig) (*server.MCPServer, error) {
 	}
 
 	return ghServer, nil
+}
+
+type githubTokenKey struct{}
+
+type HTTPServerConfig struct {
+	// Version of the server
+	Version string
+
+	// GitHub Host to target for API requests (e.g. github.com or github.enterprise.com)
+	Host string
+
+	// GitHub Token to authenticate with the GitHub API (optional for HTTP mode with OAuth)
+	Token string
+
+	// EnabledToolsets is a list of toolsets to enable
+	// See: https://github.com/github/github-mcp-server?tab=readme-ov-file#tool-configuration
+	EnabledToolsets []string
+
+	// Whether to enable dynamic toolsets
+	// See: https://github.com/github/github-mcp-server?tab=readme-ov-file#dynamic-tool-discovery
+	DynamicToolsets bool
+
+	// ReadOnly indicates if we should only register read-only tools
+	ReadOnly bool
+
+	// ExportTranslations indicates if we should export translations
+	// See: https://github.com/github/github-mcp-server?tab=readme-ov-file#i18n--overriding-descriptions
+	ExportTranslations bool
+
+	// EnableCommandLogging indicates if we should log commands
+	EnableCommandLogging bool
+
+	// Path to the log file if not stderr
+	LogFilePath string
+
+	// Content window size
+	ContentWindowSize int
+
+	// Port to listen on for HTTP server
+	Port int
 }
 
 type StdioServerConfig struct {
@@ -192,6 +257,77 @@ type StdioServerConfig struct {
 
 	// Content window size
 	ContentWindowSize int
+}
+
+func RunHTTPServer(cfg HTTPServerConfig) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	t, dumpTranslations := translations.TranslationHelper()
+
+	ghServer, err := NewMCPServer(MCPServerConfig{
+		Version:           cfg.Version,
+		Host:              cfg.Host,
+		Token:             cfg.Token,
+		EnabledToolsets:   cfg.EnabledToolsets,
+		DynamicToolsets:   cfg.DynamicToolsets,
+		ReadOnly:          cfg.ReadOnly,
+		Translator:        t,
+		ContentWindowSize: cfg.ContentWindowSize,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create MCP server: %w", err)
+	}
+
+	logrusLogger := logrus.New()
+	if cfg.LogFilePath != "" {
+		file, err := os.OpenFile(cfg.LogFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			return fmt.Errorf("failed to open log file: %w", err)
+		}
+
+		logrusLogger.SetLevel(logrus.DebugLevel)
+		logrusLogger.SetOutput(file)
+	}
+
+	httpOptions := []server.StreamableHTTPOption{
+		server.WithLogger(logrusLogger),
+		server.WithHeartbeatInterval(30 * time.Second),
+		server.WithHTTPContextFunc(extractTokenFromAuthHeader),
+	}
+
+	httpServer := server.NewStreamableHTTPServer(ghServer, httpOptions...)
+
+	if cfg.ExportTranslations {
+		dumpTranslations()
+	}
+
+	addr := fmt.Sprintf(":%d", cfg.Port)
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: httpServer,
+	}
+
+	_, _ = fmt.Fprintf(os.Stderr, "GitHub MCP Server running on HTTP at %s\n", addr)
+
+	errC := make(chan error, 1)
+	go func() {
+		errC <- srv.ListenAndServe()
+	}()
+
+	select {
+	case <-ctx.Done():
+		logrusLogger.Infof("Shutting down server...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
+	case err := <-errC:
+		if err != nil && err != http.ErrServerClosed {
+			return fmt.Errorf("error running server: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // RunStdioServer is not concurrent safe.
@@ -363,11 +499,30 @@ func newGHESHost(hostname string) (apiHost, error) {
 		return apiHost{}, fmt.Errorf("failed to parse GHES GraphQL URL: %w", err)
 	}
 
-	uploadURL, err := url.Parse(fmt.Sprintf("%s://%s/api/uploads/", u.Scheme, u.Hostname()))
+	// Check if subdomain isolation is enabled
+	// See https://docs.github.com/en/enterprise-server@3.17/admin/configuring-settings/hardening-security-for-your-enterprise/enabling-subdomain-isolation#about-subdomain-isolation
+	hasSubdomainIsolation := checkSubdomainIsolation(u.Scheme, u.Hostname())
+
+	var uploadURL *url.URL
+	if hasSubdomainIsolation {
+		// With subdomain isolation: https://uploads.hostname/
+		uploadURL, err = url.Parse(fmt.Sprintf("%s://uploads.%s/", u.Scheme, u.Hostname()))
+	} else {
+		// Without subdomain isolation: https://hostname/api/uploads/
+		uploadURL, err = url.Parse(fmt.Sprintf("%s://%s/api/uploads/", u.Scheme, u.Hostname()))
+	}
 	if err != nil {
 		return apiHost{}, fmt.Errorf("failed to parse GHES Upload URL: %w", err)
 	}
-	rawURL, err := url.Parse(fmt.Sprintf("%s://%s/raw/", u.Scheme, u.Hostname()))
+
+	var rawURL *url.URL
+	if hasSubdomainIsolation {
+		// With subdomain isolation: https://raw.hostname/
+		rawURL, err = url.Parse(fmt.Sprintf("%s://raw.%s/", u.Scheme, u.Hostname()))
+	} else {
+		// Without subdomain isolation: https://hostname/raw/
+		rawURL, err = url.Parse(fmt.Sprintf("%s://%s/raw/", u.Scheme, u.Hostname()))
+	}
 	if err != nil {
 		return apiHost{}, fmt.Errorf("failed to parse GHES Raw URL: %w", err)
 	}
@@ -378,6 +533,29 @@ func newGHESHost(hostname string) (apiHost, error) {
 		uploadURL:   uploadURL,
 		rawURL:      rawURL,
 	}, nil
+}
+
+// checkSubdomainIsolation detects if GitHub Enterprise Server has subdomain isolation enabled
+// by attempting to ping the raw.<host>/_ping endpoint on the subdomain. The raw subdomain must always exist for subdomain isolation.
+func checkSubdomainIsolation(scheme, hostname string) bool {
+	subdomainURL := fmt.Sprintf("%s://raw.%s/_ping", scheme, hostname)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		// Don't follow redirects - we just want to check if the endpoint exists
+		//nolint:revive // parameters are required by http.Client.CheckRedirect signature
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	resp, err := client.Get(subdomainURL)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	return resp.StatusCode == http.StatusOK
 }
 
 // Note that this does not handle ports yet, so development environments are out.
@@ -426,4 +604,66 @@ func (t *bearerAuthTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	req = req.Clone(req.Context())
 	req.Header.Set("Authorization", "Bearer "+t.token)
 	return t.transport.RoundTrip(req)
+}
+
+func extractTokenFromAuthHeader(ctx context.Context, r *http.Request) context.Context {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		return context.WithValue(ctx, githubTokenKey{}, token)
+	}
+	return ctx
+}
+// cleanToolsets cleans and handles special toolset keywords:
+// - Duplicates are removed from the result
+// - Removes whitespaces
+// - Validates toolset names and returns invalid ones separately
+// - "all": Returns ["all"] immediately, ignoring all other toolsets
+// - when dynamicToolsets is true, filters out "all" from the enabled toolsets
+// - "default": Replaces with the actual default toolset IDs from GetDefaultToolsetIDs()
+// Returns: (validToolsets, invalidToolsets)
+func cleanToolsets(enabledToolsets []string, dynamicToolsets bool) ([]string, []string) {
+	seen := make(map[string]bool)
+	result := make([]string, 0, len(enabledToolsets))
+	invalid := make([]string, 0)
+	validIDs := github.GetValidToolsetIDs()
+
+	// Add non-default toolsets, removing duplicates and trimming whitespace
+	for _, toolset := range enabledToolsets {
+		trimmed := strings.TrimSpace(toolset)
+		if trimmed == "" {
+			continue
+		}
+		if !seen[trimmed] {
+			seen[trimmed] = true
+			if trimmed != github.ToolsetMetadataDefault.ID && trimmed != github.ToolsetMetadataAll.ID {
+				// Validate the toolset name
+				if validIDs[trimmed] {
+					result = append(result, trimmed)
+				} else {
+					invalid = append(invalid, trimmed)
+				}
+			}
+		}
+	}
+
+	hasDefault := seen[github.ToolsetMetadataDefault.ID]
+	hasAll := seen[github.ToolsetMetadataAll.ID]
+
+	// Handle "all" keyword - return early if not in dynamic mode
+	if hasAll && !dynamicToolsets {
+		return []string{github.ToolsetMetadataAll.ID}, invalid
+	}
+
+	// Expand "default" keyword to actual default toolsets
+	if hasDefault {
+		for _, defaultToolset := range github.GetDefaultToolsetIDs() {
+			if !seen[defaultToolset] {
+				result = append(result, defaultToolset)
+				seen[defaultToolset] = true
+			}
+		}
+	}
+
+	return result, invalid
 }
